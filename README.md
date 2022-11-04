@@ -25,8 +25,8 @@ def process_pets_from_gql(pets):
         print(pet.species)
 
 class GqlBackendWithAuth(clearskies_gql.backends.GqlBackend):
-    def __init__(self, requests, my_auth_method):
-        super().__init__(requests)
+    def __init__(self, requests, environment, logging, my_auth_method):
+        super().__init__(requests, environment, logging)
         self.configure(
             url='https://gql.server.example.com',
             auth=my_auth_method,
