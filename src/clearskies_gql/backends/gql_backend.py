@@ -1,7 +1,8 @@
 from clearskies.backends import ApiBackend
+from clearskies.authentication.public import Public
 from clearskies.functional import string
 from typing import Any, Callable, Dict, List, Tuple
-from clearskies.column_types import BelongsTo
+from clearskies.column_types import BelongsTo, HasMany
 import json
 class GqlBackend(ApiBackend):
     _requests = None
@@ -23,24 +24,28 @@ class GqlBackend(ApiBackend):
             raise ValueError(
                 "Failed to find GQL Server URL.  Set it by extending the GqlBackend and setting the 'url' parameter of the configure method, or via the 'gql_server_url' environment variable"
             )
-        self._auth = auth
+        self._auth = auth if auth is not None else Public()
 
     def records(self, configuration, model, next_page_data=None):
-        plural_object_name = model.table_name()
+        plural_object_name = string.make_plural(model.table_name())
         search_string = self._build_gql_search_string(configuration.get('wheres'), model)
         gql_lines = ['query Query {', plural_object_name + search_string + '{']
         gql_lines.extend(self._record_selects(configuration, model))
         gql_lines.append('}')
         gql_lines.append('}')
         response = self._execute_gql(gql_lines)
-        records = self._map_records_response(response.json())
+        records = self._map_records_response(response.json(), model)
         return records
 
     def _record_selects(self, configuration, model):
         lines = []
         if configuration.get('select_all'):
             for column in model.columns().values():
-                if column.is_temporary:
+                if column.is_temporary or isinstance(column, HasMany):
+                    continue
+                if isinstance(column, BelongsTo):
+                    parent_id_column_name = column.parent_models.get_id_column_name()
+                    lines.append(column.config('model_column_name') + '{' + parent_id_column_name + '}')
                     continue
                 lines.append(column.name)
         elif configuration.get('selects'):
@@ -49,6 +54,14 @@ class GqlBackend(ApiBackend):
                     lines.append(column_name)
 
         return lines
+
+    def _map_records_response(self, json, model):
+        if not 'data' in json:
+            raise ValueError("Unexpected response from records request")
+        plural_object_name = string.make_plural(model.table_name())
+        if plural_object_name not in json['data']:
+            raise ValueError("Unexpected response from records request")
+        return json['data'][plural_object_name]
 
     def _build_gql_search_string(self, conditions, model):
         if not conditions:
@@ -61,26 +74,53 @@ class GqlBackend(ApiBackend):
             value = json.dumps(condition['values'][0])
             parts.append(f'{column_name}: {value}')
 
-        return '(' + ', '.join(parts) + ')'
+        return '(where: {' + ', '.join(parts) + '})'
 
     def count(self, configuration, model):
         # cheating badly and ugl-ly
         return len(self.records(configuration, model))
 
     def create(self, data, model):
-        title_name = model.__class__.__name__
-        plural_title = string.snake_case_to_title_case(model.table_name())
-        gql_lines = [f'mutation create{title_name}( input: [']
-        gql_lines.append('    {')
+        plural_snake_case_name = string.make_plural(model.table_name())
+        singular_title_name = string.snake_case_to_title_case(model.table_name())
+        plural_title_name = string.make_plural(singular_title_name)
+        input_name = f'[{singular_title_name}CreateInput!]!'
+        input_variables = {}
+        gql_lines = [f'mutation Create{plural_title_name}($input: ' + input_name + ') {']
+        gql_lines.append(f'create{plural_title_name}(' + 'input: $input) {')
+        gql_lines.append('  info { nodesCreated }')
         for (key, value) in data.items():
-            gql_lines.append(f'{key}: {value}')
-        gql_lines.append('    }')
-        gql_lines.append('] )')
-        return self._execute_gql(gql_lines)
+            input_variables[key] = value
+        gql_lines.append('  }')
+        gql_lines.append('}')
+        print(gql_lines)
+        print({'variables': {'input': input_variables}})
+        result = self._execute_gql(
+            gql_lines,
+            extra_properties={'variables': {
+                'input': input_variables
+            }},
+            operation_name=f'Create{plural_title_name}',
+        )
+
+        # now fetch out the newly created record
+        id_column_name = model.id_column_name
+        results = self.records({
+            'table_name':
+            model.table_name(),
+            'select_all':
+            True,
+            'wheres': [{
+                'column': id_column_name,
+                'operator': '=',
+                'values': [data[id_column_name]],
+            }]
+        }, model)
+        return results[0]
 
     def update(self, id, data, model):
-        title_name = model.__class__.__name__
-        gql_lines = [f'mutation update{title_name}( input: [']
+        plural_title_name = string.make_plural(string.snake_case_to_title_case(model.table_name()))
+        gql_lines = [f'mutation update{plural_title_name}( input: [']
         gql_lines.append('    {')
         for (key, value) in data.items():
             gql_lines.append(f'{key}: {value}')
@@ -89,12 +129,37 @@ class GqlBackend(ApiBackend):
         return self._execute_gql(gql_lines)
 
     def delete(self, id, model):
-        pass
+        singular_title_name = string.snake_case_to_title_case(model.table_name())
+        plural_title_name = string.make_plural(singular_title_name)
+        gql_lines = [
+            f'mutation Delete{plural_title_name}($where: {singular_title_name}Where) ' + '{',
+            f'  delete{plural_title_name}(where: $where) ' + '{',
+            '    nodesDeleted',
+            '  }',
+            '}',
+        ]
+        where = {
+            'variables': {
+                'where': {
+                    model.id_column_name: id,
+                }
+            }
+        }
+        result = self._execute_gql(gql_lines, extra_properties=where, operation_name=f'Delete{plural_title_name}')
 
-    def _execute_gql(self, gql_lines):
-        self._logging.info(f'Sending the following GQL to {self.url}:')
-        self._logging.info("\n".join(gql_lines))
-        return self._execute_request(self.url, 'POST', json={"query": ' '.join(gql_lines)}, retry_auth=True)
+    def _execute_gql(self, gql_lines, extra_properties=None, operation_name=None):
+        request_json = {"query": ' '.join(gql_lines)}
+        if extra_properties:
+            request_json = {
+                **request_json,
+                **extra_properties,
+            }
+        if operation_name:
+            request_json['operation_name'] = operation_name
+        self._logging.info(f'Sending the following JSON to {self.url}:')
+        self._logging.info(json.dumps(request_json))
+        print(json.dumps(request_json))
+        return self._execute_request(self.url, 'POST', json=request_json, retry_auth=True)
 
     def allowed_pagination_keys(self) -> List[str]:
         return ['after']
@@ -127,10 +192,7 @@ class GqlBackend(ApiBackend):
         if isinstance(column, BelongsTo):
             return self._belongs_to_to_backend(column, backend_data)
 
-        # if it's not one of the above we want to jsonify it because strings should be surrounded
-        # by quotes, in gql, and integers should be "bare".  GQL isn't technically JSON in this case,
-        # but JSON happens to give the same results
-        return json.dumps(column.to_backend(backend_data))
+        return column.to_backend(backend_data)
 
     def _belongs_to_to_backend(self, column, backend_data):
         if not backend_data.get(column.name):
@@ -139,6 +201,7 @@ class GqlBackend(ApiBackend):
         model_column_name = column.config('model_column_name')
         parent = column.parent_models
         parent_id_column_name = parent.id_column_name
-        new_id = json.dumps(backend_data[column.name])
+        new_id = backend_data[column.name]
+        del backend_data[column.name]
 
-        return model_column_name + ': { connect: { where: { node: { ' + parent_id_column_name + ': ' + new_id + ' } } } }'
+        return {**backend_data, model_column_name: {"connect": {"where": {"node": {parent_id_column_name: new_id}}}}}
