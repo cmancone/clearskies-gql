@@ -17,12 +17,12 @@ with open(path.join(here, 'README.md'), encoding='utf-8') as f:
     long_description = f.read()
 
 setup(
-    name='clear-skies-aws',
-    version='1.1.2',
-    description='clearskies bindings for working in AWS',
+    name='clear-skies-gql',
+    version='0.1.1',
+    description='clearskies bindings for Apollo GQL',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url='https://github.com/cmancone/clearskies-aws',
+    url='https://github.com/cmancone/clearskies-gql',
     author='Conor Mancone',
     author_email='cmancone@gmail.com',
     license='MIT',
@@ -39,5 +39,5 @@ setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     python_requires=">=3.6",
-    install_requires=['boto3', 'clear-skies', 'akeyless-cloud-id'],
+    install_requires=['clear-skies'],
 )
