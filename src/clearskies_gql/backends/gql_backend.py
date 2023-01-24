@@ -75,7 +75,7 @@ class GqlBackend(ApiBackend):
         return lines
 
     def _map_records_response(self, json, model):
-        if not 'data' in json:
+        if 'data' not in json:
             raise ValueError("Unexpected response from records request")
         plural_object_names = [
             string.make_plural(model.table_name()),
@@ -189,7 +189,7 @@ class GqlBackend(ApiBackend):
             f'mutation Mutation($connect: {singular_title_name}ConnectInput, $where: {singular_title_name}Where) ' +
             '{',
             f'  update{plural_title_name}(connect: $connect, where: $where) ' + '{',
-            '    info { bookmark }',
+            '    info { relationshipsCreated }',
             '  }',
             '}',
         ]
@@ -198,12 +198,14 @@ class GqlBackend(ApiBackend):
         for to_record_id in to_record_ids:
             connection_entries.append({'where': {'node': {to_record_id_column_name: to_record_id}}})
         query_data = {
-            'connect': {
-                connection_name: connection_entries,
-            },
-            'where': {
-                from_record_id_column_name: from_record_id,
-            },
+            'variables': {
+                'connect': {
+                    connection_name: connection_entries,
+                },
+                'where': {
+                    from_record_id_column_name: from_record_id,
+                },
+            }
         }
         self._execute_gql(gql_lines, extra_properties=query_data)
 
@@ -217,7 +219,7 @@ class GqlBackend(ApiBackend):
             f'mutation Mutation($disconnect: {singular_title_name}DisconnectInput, $where: {singular_title_name}Where) '
             + '{',
             f'  update{plural_title_name}(disconnect: $disconnect, where: $where) ' + '{',
-            '    info { bookmark }',
+            '    info { relationshipsDeleted }',
             '  }',
             '}',
         ]
@@ -226,12 +228,14 @@ class GqlBackend(ApiBackend):
         for to_record_id in to_record_ids:
             disconnection_entries.append({'where': {'node': {to_record_id_column_name: to_record_id}}})
         query_data = {
-            'disconnect': {
-                connection_name: disconnection_entries,
-            },
-            'where': {
-                from_record_id_column_name: from_record_id,
-            },
+            'variables': {
+                'disconnect': {
+                    connection_name: disconnection_entries,
+                },
+                'where': {
+                    from_record_id_column_name: from_record_id,
+                },
+            }
         }
         self._execute_gql(gql_lines, extra_properties=query_data)
 

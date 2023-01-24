@@ -161,7 +161,6 @@ class Connection(String):
         if to_create:
             # since this column is specific to GQL, we're going to cheat and just invoke the backend directly.
             # it's just easier that way.  This will make testing slightly more tricky :shrug:
-            for id_to_delete in to_delete:
-                model._backend.connect(own_id_column_name, id, related_id_column_name, to_create, self.name, model)
+            model._backend.connect(own_id_column_name, id, related_id_column_name, to_create, self.name, model)
 
         return data

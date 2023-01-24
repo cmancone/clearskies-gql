@@ -3,12 +3,16 @@ from unittest.mock import MagicMock
 from collections import OrderedDict
 from types import SimpleNamespace
 from .gql_backend import GqlBackend
+from clearskies.authentication.public import Public
 import clearskies
 import logging
 from clearskies.di import StandardDependencies
 class User(clearskies.Model):
     def __init__(self, gql_backend, columns):
         super().__init__(gql_backend, columns)
+
+    def table_name(cls):
+        return 'user'
 
     def columns_configuration(self):
         return OrderedDict([
@@ -49,11 +53,11 @@ class GqlBackendTest(unittest.TestCase):
 
         backend.configure()
         self.assertEquals('https://env.example.com', backend.url)
-        self.assertEquals(None, backend._auth)
+        self.assertTrue(type(backend._auth) == Public)
         environment.get.assert_called_with('gql_server_url', silent=True)
 
     def test_query(self):
-        response = type('', (), {'ok': True, 'json': lambda: {"data": [{"id": 5}, {"id": 10}]}})
+        response = type('', (), {'ok': True, 'json': lambda: {"data": {"users": [{"id": 5}, {"id": 10}]}}})
         self.requests.request = MagicMock(return_value=response)
         records = self.gql_backend.records(
             {
@@ -90,5 +94,14 @@ class GqlBackendTest(unittest.TestCase):
             'POST',
             'https://example.gql',
             headers={'Authorization': 'Bearer: asdfer'},
-            json={'query': 'query Query { users(age: 5, id: 123){ id name category_id age } }'}
+            json={
+                'query':
+                'query users($where: UserWhere) {   users(where: $where) { id\n    name\n    category_id\n    age   }}',
+                'variables': {
+                    'where': {
+                        'age': 5,
+                        'id': 123
+                    }
+                },
+            }
         )
