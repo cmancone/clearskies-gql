@@ -3,6 +3,7 @@ from clearskies.authentication.public import Public
 from clearskies.functional import string
 from typing import Any, Callable, Dict, List, Tuple
 from clearskies.column_types import BelongsTo, HasMany
+from ..column_types import Connection
 import json
 class GqlBackend(ApiBackend):
     _requests = None
@@ -27,13 +28,26 @@ class GqlBackend(ApiBackend):
         self._auth = auth if auth is not None else Public()
 
     def records(self, configuration, model, next_page_data=None):
-        plural_object_name = string.make_plural(model.table_name())
-        search_string = self._build_gql_search_string(configuration.get('wheres'), model)
-        gql_lines = ['query Query {', plural_object_name + search_string + '{']
-        gql_lines.extend(self._record_selects(configuration, model))
-        gql_lines.append('}')
-        gql_lines.append('}')
-        response = self._execute_gql(gql_lines)
+        camel_case_name = string.snake_case_to_camel_case(model.table_name())
+        plural_object_name = string.make_plural(camel_case_name)
+        title_name = string.snake_case_to_title_case(model.table_name())
+        search_values = self._build_gql_search_string(configuration.get('wheres'), model)
+        where_type_declaration = ''
+        where_param_declaration = ''
+        if search_values:
+            where_type_declaration = '($where: ' + title_name + 'Where)'
+            where_param_declaration = '(where: $where)'
+        gql_lines = [
+            f'query {plural_object_name}{where_type_declaration}' + ' {',
+            f'  {plural_object_name}{where_param_declaration}' + ' {',
+            "\n    ".join(self._record_selects(configuration, model)), '  }'
+            '}'
+        ]
+        if search_values:
+            extra_properties = {'variables': {'where': search_values}}
+        else:
+            extra_properties = None
+        response = self._execute_gql(gql_lines, extra_properties=extra_properties)
         records = self._map_records_response(response.json(), model)
         return records
 
@@ -45,7 +59,12 @@ class GqlBackend(ApiBackend):
                     continue
                 if isinstance(column, BelongsTo):
                     parent_id_column_name = column.parent_models.get_id_column_name()
-                    lines.append(column.config('model_column_name') + '{' + parent_id_column_name + '}')
+                    lines.append(column.name + '{' + parent_id_column_name + '}')
+                    continue
+                if isinstance(column, Connection):
+                    if not column.is_readable:
+                        continue
+                    lines.append(column.name + '{' + ' '.join(column.config('readable_related_columns')) + '}')
                     continue
                 lines.append(column.name)
         elif configuration.get('selects'):
@@ -56,25 +75,37 @@ class GqlBackend(ApiBackend):
         return lines
 
     def _map_records_response(self, json, model):
-        if not 'data' in json:
+        if 'data' not in json:
             raise ValueError("Unexpected response from records request")
-        plural_object_name = string.make_plural(model.table_name())
-        if plural_object_name not in json['data']:
-            raise ValueError("Unexpected response from records request")
-        return json['data'][plural_object_name]
+        plural_object_names = [
+            string.make_plural(model.table_name()),
+            string.make_plural(string.snake_case_to_camel_case(model.table_name())),
+        ]
+        for plural_object_name in plural_object_names:
+            if plural_object_name in json['data']:
+                return json['data'][plural_object_name]
+        raise ValueError("Unexpected response from records request")
 
     def _build_gql_search_string(self, conditions, model):
         if not conditions:
-            return ''
+            return {}
 
-        parts = []
+        search_values = {}
+        columns = model.columns()
         for condition in conditions:
             # we're being really stupid for now
             column_name = condition['column']
-            value = json.dumps(condition['values'][0])
-            parts.append(f'{column_name}: {value}')
+            value = condition['values'][0]
+            if isinstance(columns.get(column_name), BelongsTo):
+                parent_id_column_name = columns.get(column_name).parent_models.id_column_name
+                search_values[f'{column_name}_SOME'] = {parent_id_column_name: value}
+            elif isinstance(columns.get(column_name), Connection):
+                related_id_column_name = columns.get(column_name).config('related_id_column_name')
+                search_values[f'{column_name}_SOME'] = {related_id_column_name: value}
+            else:
+                search_values[column_name] = value
 
-        return '(where: {' + ', '.join(parts) + '})'
+        return search_values
 
     def count(self, configuration, model):
         # cheating badly and ugl-ly
@@ -93,8 +124,6 @@ class GqlBackend(ApiBackend):
             input_variables[key] = value
         gql_lines.append('  }')
         gql_lines.append('}')
-        print(gql_lines)
-        print({'variables': {'input': input_variables}})
         result = self._execute_gql(
             gql_lines,
             extra_properties={'variables': {
@@ -119,6 +148,9 @@ class GqlBackend(ApiBackend):
         return results[0]
 
     def update(self, id, data, model):
+        if not data:
+            return model.data
+
         plural_title_name = string.make_plural(string.snake_case_to_title_case(model.table_name()))
         gql_lines = [f'mutation update{plural_title_name}( input: [']
         gql_lines.append('    {')
@@ -147,6 +179,66 @@ class GqlBackend(ApiBackend):
         }
         result = self._execute_gql(gql_lines, extra_properties=where, operation_name=f'Delete{plural_title_name}')
 
+    def connect(
+        self, from_record_id_column_name, from_record_id, to_record_id_column_name, to_record_ids, connection_name,
+        model
+    ):
+        singular_title_name = string.snake_case_to_title_case(model.table_name())
+        plural_title_name = string.make_plural(singular_title_name)
+        gql_lines = [
+            f'mutation Mutation($connect: {singular_title_name}ConnectInput, $where: {singular_title_name}Where) ' +
+            '{',
+            f'  update{plural_title_name}(connect: $connect, where: $where) ' + '{',
+            '    info { relationshipsCreated }',
+            '  }',
+            '}',
+        ]
+        connection_entries = []
+        # could probably make this a one-liner but it would be harder to read
+        for to_record_id in to_record_ids:
+            connection_entries.append({'where': {'node': {to_record_id_column_name: to_record_id}}})
+        query_data = {
+            'variables': {
+                'connect': {
+                    connection_name: connection_entries,
+                },
+                'where': {
+                    from_record_id_column_name: from_record_id,
+                },
+            }
+        }
+        self._execute_gql(gql_lines, extra_properties=query_data)
+
+    def disconnect(
+        self, from_record_id_column_name, from_record_id, to_record_id_column_name, to_record_ids, connection_name,
+        model
+    ):
+        singular_title_name = string.snake_case_to_title_case(model.table_name())
+        plural_title_name = string.make_plural(singular_title_name)
+        gql_lines = [
+            f'mutation Mutation($disconnect: {singular_title_name}DisconnectInput, $where: {singular_title_name}Where) '
+            + '{',
+            f'  update{plural_title_name}(disconnect: $disconnect, where: $where) ' + '{',
+            '    info { relationshipsDeleted }',
+            '  }',
+            '}',
+        ]
+        disconnection_entries = []
+        # could probably make this a one-liner but it would be harder to read
+        for to_record_id in to_record_ids:
+            disconnection_entries.append({'where': {'node': {to_record_id_column_name: to_record_id}}})
+        query_data = {
+            'variables': {
+                'disconnect': {
+                    connection_name: disconnection_entries,
+                },
+                'where': {
+                    from_record_id_column_name: from_record_id,
+                },
+            }
+        }
+        self._execute_gql(gql_lines, extra_properties=query_data)
+
     def _execute_gql(self, gql_lines, extra_properties=None, operation_name=None):
         request_json = {"query": ' '.join(gql_lines)}
         if extra_properties:
@@ -158,8 +250,7 @@ class GqlBackend(ApiBackend):
             request_json['operation_name'] = operation_name
         self._logging.info(f'Sending the following JSON to {self.url}:')
         self._logging.info(json.dumps(request_json))
-        print(json.dumps(request_json))
-        return self._execute_request(self.url, 'POST', json=request_json, retry_auth=True)
+        return self._execute_request(self.url, 'POST', json=request_json)
 
     def allowed_pagination_keys(self) -> List[str]:
         return ['after']
@@ -198,10 +289,9 @@ class GqlBackend(ApiBackend):
         if not backend_data.get(column.name):
             return backend_data
 
-        model_column_name = column.config('model_column_name')
         parent = column.parent_models
         parent_id_column_name = parent.id_column_name
         new_id = backend_data[column.name]
         del backend_data[column.name]
 
-        return {**backend_data, model_column_name: {"connect": {"where": {"node": {parent_id_column_name: new_id}}}}}
+        return {**backend_data, column.name: {"connect": {"where": {"node": {parent_id_column_name: new_id}}}}}
